@@ -1,0 +1,940 @@
+---
+title: "Reproduction des tableaux du document @bureauoftransportationstatisticsDOMESTICAIRFARECONSUMER2026"
+subtitle: "Jeux de données de @btsOriginDestinationSurvey2026 et @bureauoftransportationstatisticsOriginDestinationSurvey2025"
+author: Alexandre Le Roux
+date: "2026/07/06"
+institute: Université de Montréal
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    # code-fold: show
+    # code-tools: true
+    smooth-scroll: true
+    embed-resources: true
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  cache = FALSE
+)
+```
+
+```{r load-db1b, include=FALSE}
+library(DBI)
+library(duckdb)
+library(here)
+library(fs)
+library(dbplyr)
+
+source(here("R", "01_ingest.R"))
+source(here("R", "02_prepare.R"))
+
+con <- dbConnect(duckdb())
+
+# Lecture de la table de données des marchés DB1B
+dbExecute(
+  con,
+  sprintf(
+    "CREATE OR REPLACE VIEW db1b_mkt AS
+     SELECT *
+     FROM read_parquet('%s', hive_partitioning = true)",
+    here("data/interim/MARKET/DB1B/**/*.parquet")
+  )
+)
+
+# Lecture de la table de données des marchés DB1C
+dbExecute(
+  con,
+  sprintf(
+    "CREATE OR REPLACE VIEW db1c_mkt AS
+     SELECT *
+     FROM read_parquet('%s', hive_partitioning = true)",
+    here("data/interim/MARKET/DB1C/**/*.parquet")
+  )
+)
+
+db1b_mkt <- tbl(con, "db1b_mkt")
+db1c_mkt <- tbl(con, "db1c_mkt")
+
+# Création du vecteur nommé des différentes tables de référence
+lookups <- load_lookups(
+  here("data/external/refs/") |> dir_ls(glob = "*ref_*.csv")
+)
+```
+
+# Aperçu des jeux de données
+
+```{r glimpse-db1c}
+# Affiche un aperçu de la table des marchés DB1C
+glimpse(db1c_mkt)
+```
+
+```{r count-db1c}
+# Calcule le nombre d'observations de la table des marchés DB1C
+N <- db1c_mkt |> pull(MktID) |> length()
+```
+
+```{r render-count-db1c, echo=FALSE}
+N
+```
+
+```{r glimpse-db1b}
+# Affiche un aperçu de la table des marchés DB1B
+glimpse(db1b_mkt)
+```
+
+```{r count-db1b}
+# Calcule le nombre d'observations de la table des marchés DB1B
+N <- db1b_mkt |> pull(MktID) |> length()
+```
+
+```{r render-count-db1b, echo=FALSE}
+N
+```
+
+# Principaux marchés origine-destination et transporteurs
+```{r compute-table-1}
+library(data.table)
+
+carrier_stats <- db1c_mkt |>
+  filter(
+    RpYear == 2025,
+    RpMonth %in% c(10, 11, 12),
+    MktGeoType == "2",
+    V_Yield == 0,
+    MktAmount >= 50,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  mutate(
+    city1 = pmin(OriginCityMarketID, DestCityMarketID),
+    city2 = pmax(OriginCityMarketID, DestCityMarketID),
+    MktDistanceGroup50 = as.integer(pmin(
+      ceiling(pmax(NonStopMiles, 1) / 50),
+      49
+    ))
+  ) |>
+  group_by(MktDistanceGroup50, city1, city2, MktCarrier) |>
+  summarise(
+    passengers = n() * 2.5,
+    mkt_fare = mean(MktAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(MktDistanceGroup50, city1, city2) |>
+  mutate(
+    mkt_passengers = sum(passengers, na.rm = TRUE),
+    ms = 100 * passengers / mkt_passengers
+  ) |>
+  ungroup()
+
+# Sélectionne le transporteur ayant le plus grand nombre de passagers pour
+# chaque marché origine-destination
+largest_carrier <- carrier_stats |>
+  group_by(MktDistanceGroup50, city1, city2) |>
+  slice_max(passengers, n = 1, with_ties = FALSE) |>
+  mutate(
+    MktDistanceGroup50,
+    city1,
+    city2,
+    carrier_lg = MktCarrier,
+    large_ms = ms,
+    fare_lg = mkt_fare,
+    .keep = "none"
+  )
+
+# Sélectionne le transporteur proposant le prix moyen le plus faible parmi
+# ceux détenant au moins 10 % de part de marché
+lowest_carrier <- carrier_stats |>
+  group_by(MktDistanceGroup50, city1, city2) |>
+  filter(if_else(any(ms >= 10), ms >= 10, TRUE)) |>
+  slice_min(mkt_fare, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    MktDistanceGroup50,
+    city1,
+    city2,
+    carrier_low = MktCarrier,
+    lf_ms = ms,
+    fare_low = mkt_fare,
+    .keep = "none"
+  )
+
+# Agrège les données par marché origine-destination et sélectionne les 1 000
+# marchés ayant le plus grand nombre de passagers par jour
+table1 <- db1c_mkt |>
+  filter(
+    RpYear == 2025,
+    RpMonth %in% c(10, 11, 12),
+    MktGeoType == "2",
+    V_Yield == 0,
+    MktAmount >= 25,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  mutate(
+    city1 = pmin(OriginCityMarketID, DestCityMarketID),
+    city2 = pmax(OriginCityMarketID, DestCityMarketID),
+    MktDistanceGroup50 = as.integer(pmin(
+      ceiling(pmax(NonStopMiles, 1) / 50),
+      49
+    ))
+  ) |>
+  group_by(MktDistanceGroup50, city1, city2) |>
+  summarise(
+    nsmiles = max(NonStopMiles, na.rm = TRUE),
+    passengers = n() * 2.5 / 92,
+    fare = mean(MktAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  slice_max(passengers, n = 1000, with_ties = FALSE) |>
+  left_join(largest_carrier, by = c("MktDistanceGroup50", "city1", "city2")) |>
+  left_join(lowest_carrier, by = c("MktDistanceGroup50", "city1", "city2")) |>
+  arrange(MktDistanceGroup50, desc(fare)) |>
+  collect() |>
+  mutate(
+    MktDistanceGroup50 = factor(
+      MktDistanceGroup50,
+      levels = 1:49,
+      labels = lookups$distance_groups_50$Description,
+      ordered = TRUE
+    )
+  ) |>
+  as.data.table()
+```
+
+```{r render-table-1, echo=FALSE}
+# Met en forme et exporte le tableau 1
+library(gtable)
+library(gt)
+
+table1_gt <- table1 |>
+  gt(groupname_col = "MktDistanceGroup50") |>
+  tab_header(
+    title = "Market and Carrier Fare Information",
+    subtitle = "Top 1,000 Contiguous State City-Pair Markets Fourth Quarter 2025"
+  ) |>
+  tab_spanner(label = "Table 1", columns = c(city1, city2)) |>
+  tab_spanner(label = "Market Data", columns = c(nsmiles, passengers, fare)) |>
+  tab_spanner(
+    label = "Largest Carrier",
+    columns = c(carrier_lg, large_ms, fare_lg)
+  ) |>
+  tab_spanner(
+    label = "Lowest Fare Carrier 1/",
+    columns = c(carrier_low, lf_ms, fare_low)
+  ) |>
+  cols_label(
+    city1 = "City-Pair",
+    city2 = "",
+    nsmiles = "Nonstop<br>Distance",
+    passengers = "Psgrs<br>Per<br>Day",
+    fare = "Average<br>Each Way<br>Fare",
+    carrier_lg = "Carrier",
+    large_ms = "Percent<br>Market<br>Share",
+    fare_lg = "Average<br>Each Way<br>Fare 2/",
+    carrier_low = "Carrier",
+    lf_ms = "Percent<br>Market<br>Share",
+    fare_low = "Average<br>Each Way<br>Fare 2/",
+    .fn = md
+  ) |>
+  fmt_percent(
+    columns = c(large_ms, lf_ms),
+    scale_values = FALSE,
+    decimals = 0
+  ) |>
+  fmt_currency(
+    columns = c(fare, fare_lg, fare_low),
+    currency = "USD",
+    decimals = 0
+  ) |>
+  fmt_number(columns = c(nsmiles, passengers), decimals = 0, sep_mark = ".") |>
+  cols_align(align = "left", columns = c(city1, city2)) |>
+  cols_align(
+    align = "center",
+    columns = -c(city1, city2)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "left"),
+    locations = list(
+      cells_column_spanners(),
+      cells_row_groups(),
+      cells_column_labels(columns = city1)
+    )
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent"
+  ) |>
+  tab_style(
+    style = cell_borders(
+      sides = c("left"),
+      weight = px(2),
+      color = "#BFBFBF"
+    ),
+    locations = list(
+      cells_body(columns = c(nsmiles, carrier_lg, carrier_low)),
+      cells_column_labels(columns = c(nsmiles, carrier_lg, carrier_low))
+    )
+  )
+
+table1_gt |> gtsave("tab1.html", path = "outputs/tables/")
+
+table1_gt
+```
+
+# Principaux marchés origine-destination agrégés par ville
+```{r compute-table-2}
+# Agrège les données du quatrième trimestre 2025 par marché origine-destination
+# et sélectionne les 1 000 marchés ayant le plus grand nombre de passagers
+cur_table2 <- db1c_mkt |>
+  filter(
+    RpYear == 2025,
+    RpMonth %in% c(10, 11, 12),
+    V_Yield == 0,
+    MktAmount >= 50,
+    MktGeoType == 2,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  mutate(
+    city1 = pmin(OriginCityMarketID, DestCityMarketID),
+    city2 = pmax(OriginCityMarketID, DestCityMarketID)
+  ) |>
+  group_by(city1, city2) |>
+  summarise(
+    passengers = n() * 2.5,
+    fare = mean(MktAmount, na.rm = TRUE),
+    distance = mean(MilesTraveled, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  slice_max(
+    passengers,
+    n = 1000,
+    with_ties = FALSE
+  ) |>
+  mutate(
+    market = paste(city1, city2, sep = "-")
+  ) |>
+  select(
+    market,
+    city1,
+    city2,
+    passengers,
+    fare,
+    distance
+  ) |>
+  collect()
+
+# Associe les statistiques de chaque marché aux deux villes qui le composent
+cur_city <- bind_rows(
+  cur_table2 |>
+    mutate(
+      city = city1,
+      market,
+      passengers,
+      fare,
+      distance,
+      .keep = "none"
+    ),
+
+  cur_table2 |>
+    mutate(
+      city = city2,
+      market,
+      passengers,
+      fare,
+      distance,
+      .keep = "none"
+    )
+)
+
+# Agrège les données du quatrième trimestre 2024 pour les 1 000 marchés
+# sélectionnés en 2025
+ly_table2 <- db1b_mkt |>
+  filter(
+    Year == 2024,
+    Quarter == 4,
+    MktFare >= 50,
+    MktGeoType == 2,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  mutate(
+    city1 = pmin(OriginCityMarketID, DestCityMarketID),
+    city2 = pmax(OriginCityMarketID, DestCityMarketID)
+  ) |>
+  inner_join(
+    cur_table2 |> select(city1, city2),
+    by = c("city1", "city2"),
+    copy = "inline"
+  ) |>
+  group_by(city1, city2) |>
+  summarise(
+    passengers = sum(Passengers) * 10,
+    fare = sum(MktFare * Passengers) / sum(Passengers),
+    distance = sum(MktMilesFlown * Passengers) / sum(Passengers),
+    .groups = "drop"
+  ) |>
+  select(
+    city1,
+    city2,
+    passengers,
+    fare,
+    distance
+  ) |>
+  collect()
+
+# Associe les statistiques de chaque marché aux deux villes qui le composent
+ly_city <- bind_rows(
+  ly_table2 |>
+    mutate(
+      city = city1,
+      passengers,
+      fare,
+      distance,
+      .keep = "none"
+    ),
+
+  ly_table2 |>
+    mutate(
+      city = city2,
+      passengers,
+      fare,
+      distance,
+      .keep = "none"
+    )
+)
+
+# Agrège les statistiques du quatrième trimestre 2024 par ville
+ly_table2 <- ly_city |>
+  group_by(city) |>
+  summarise(
+    ly_passengers = sum(passengers),
+    ly_fare = mean(fare),
+    ly_distance = mean(distance),
+    ly_yield = ly_fare / ly_distance * 100,
+    .groups = "drop"
+  )
+
+# Agrège les statistiques du quatrième trimestre 2025 par ville et conserve
+# celles comptabilisant plus de 100 000 passagers
+table2 <- cur_city |>
+  group_by(city) |>
+  summarise(
+    markets = n_distinct(market),
+    cur_passengers = sum(passengers),
+    cur_fare = mean(fare),
+    distance = mean(distance),
+    cur_yield = cur_fare / distance * 100,
+    .groups = "drop"
+  ) |>
+  filter(cur_passengers > 100000) |>
+  left_join(ly_table2, by = c("city")) |>
+  arrange(distance) |>
+  as.data.table()
+```
+
+```{r render-table-2, echo=FALSE}
+# Met en forme et exporte le tableau 2
+table2_gt <- table2 |>
+  gt() |>
+  tab_header(
+    title = "Top 1,000 City-Pair Markets Summarized by City",
+    subtitle = "Fourth Quarter 2025 vs. Fourth Quarter 2024 Cities with 100,000 or more Passengers Sorted by Average Passenger Trip Distance"
+  ) |>
+  tab_spanner(
+    label = "Table 2",
+    columns = c(city, markets)
+  ) |>
+  tab_spanner(
+    label = "2025 q4",
+    columns = c(cur_passengers, cur_fare, cur_yield, distance)
+  ) |>
+  tab_spanner(
+    label = "2024 q4",
+    columns = c(ly_passengers, ly_fare, ly_yield, ly_distance)
+  ) |>
+  cols_label(
+    city = "City",
+    markets = "Number of<br>Markets",
+    cur_passengers = "Passengers",
+    cur_fare = "Avg.<br>Fare",
+    cur_yield = "Avg. Yield<br>(cents) 3/",
+    distance = "Avg. Psgr<br>Distance",
+    ly_passengers = "Passengers",
+    ly_fare = "Avg.<br>Fare",
+    ly_yield = "Avg. Yield<br>(cents) 3/",
+    ly_distance = "Avg. Psgr<br>Distance",
+    .fn = md
+  ) |>
+  fmt_currency(
+    columns = c(cur_fare, ly_fare),
+    currency = "USD",
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(markets, distance, ly_distance),
+    decimals = 0
+  ) |>
+  fmt_number(
+    columns = c(cur_yield, ly_yield),
+    decimals = 1,
+    sep_mark = "."
+  ) |>
+  fmt_number(
+    columns = c(cur_passengers, ly_passengers),
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  cols_align(align = "left", columns = c(city, cur_fare, ly_fare)) |>
+  cols_align(
+    align = "center",
+    columns = c(cur_yield, ly_yield)
+  ) |>
+  cols_align(
+    align = "right",
+    columns = -c(city, cur_fare, cur_yield, ly_fare, ly_yield)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "left"),
+    locations = list(
+      cells_column_spanners(),
+      cells_column_labels(columns = city)
+    )
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  ) |>
+  tab_style(
+    style = cell_borders(
+      sides = c("left"),
+      weight = px(2),
+      color = "#BFBFBF"
+    ),
+    locations = list(
+      cells_body(columns = c(cur_passengers, ly_passengers)),
+      cells_column_labels(columns = c(cur_passengers, ly_passengers))
+    )
+  )
+
+table2_gt |> gtsave("tab2.html", path = "outputs/tables/")
+
+table2_gt
+```
+
+# Marchés origine-destination présentant les plus fortes hausses tarifaires
+```{r compute-table-3}
+# Agrège les données du quatrième trimestre 2025 par marché origine-destination
+# et sélectionne les 1 000 marchés ayant le plus grand nombre de passagers
+cur_city_stats <- db1c_mkt |>
+  filter(
+    RpYear == 2025,
+    RpMonth %in% c(10, 11, 12),
+    V_Yield == 0,
+    MktAmount >= 50,
+    MktGeoType == 2,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  mutate(
+    city1 = pmin(OriginCityMarketID, DestCityMarketID),
+    city2 = pmax(OriginCityMarketID, DestCityMarketID)
+  ) |>
+  group_by(city1, city2) |>
+  summarise(
+    cur_passengers = n() * 2.5,
+    cur_fare = mean(MktAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  select(
+    city1,
+    city2,
+    cur_fare,
+    cur_passengers
+  ) |>
+  slice_max(cur_passengers, n = 1000, with_ties = FALSE) |>
+  ungroup()
+
+# Agrège les données du quatrième trimestre 2024 par marché origine-destination
+ly_city_stats <- db1b_mkt |>
+  filter(
+    Year == 2024,
+    Quarter == 4,
+    MktFare >= 50,
+    MktGeoType == 2,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  mutate(
+    city1 = pmin(OriginCityMarketID, DestCityMarketID),
+    city2 = pmax(OriginCityMarketID, DestCityMarketID)
+  ) |>
+  group_by(city1, city2) |>
+  summarise(
+    ly_passengers = sum(Passengers) * 10,
+    ly_fare = sum(MktFare * Passengers) / sum(Passengers),
+    .groups = "drop"
+  ) |>
+  select(
+    city1,
+    city2,
+    ly_fare,
+    ly_passengers
+  ) |>
+  ungroup()
+
+# Joint les statistiques de 2025 et 2024 et calcule les variations du prix
+# moyen et du nombre de passagers
+city_pct <- cur_city_stats |>
+  left_join(ly_city_stats, by = c("city1", "city2")) |>
+  mutate(
+    amount_change = cur_fare - ly_fare,
+    percent_change = 100 * amount_change / ly_fare,
+
+    amount_change_pax = cur_passengers - ly_passengers,
+    percent_change_pax = 100 * amount_change_pax / ly_passengers
+  ) |>
+  filter(
+    !is.na(ly_fare),
+    !is.na(ly_passengers),
+  )
+
+# Sélectionne les marchés dont le prix moyen a augmenté d'au moins 15 %
+table3 <- city_pct |>
+  filter(percent_change >= 15) |>
+  arrange(desc(percent_change)) |>
+  collect() |>
+  as.data.table()
+
+table3
+```
+
+## Tracé diagnostique
+```{r plot-table-3-diagnostic}
+library(ggplot2)
+
+dt1 <- city_pct |>
+  arrange(percent_change) |>
+  mutate(
+    cum_passengers = cumsum(cur_passengers),
+    total_passengers = sum(cur_passengers),
+    weighted_ecdf = cum_passengers / total_passengers
+  ) |>
+  collect() |>
+  as.data.table()
+
+# Calcule la fonction de répartition empirique des variations tarifaires
+# pondérée uniformément par marché
+dt2 <- city_pct |>
+  arrange(percent_change) |>
+  mutate(
+    ecdf = row_number() / n()
+  ) |>
+  collect() |>
+  as.data.table()
+
+# Compare les deux fonctions de répartition empirique des variations tarifaires
+ggplot() +
+  geom_step(
+    data = dt1,
+    aes(x = percent_change, y = weighted_ecdf, color = "Passenger-weighted")
+  ) +
+  geom_step(
+    data = dt2,
+    aes(x = percent_change, y = ecdf, color = "Market-weighted")
+  ) +
+  coord_flip() +
+  scale_x_continuous(breaks = seq(-25, 25, 5)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.05)) +
+  labs(
+    title = "Empirical Quantile Function of Fare Changes",
+    subtitle = "Fourth Quarter 2025 vs. Fourth Quarter 2024",
+    x = "Year-over-Year Fare Change (%)",
+    y = "Quantile"
+  ) +
+  guides(color = guide_legend(title = "Weighting")) +
+  theme(axis.text.x = element_text(angle = 40, vjust = 1, hjust = 1))
+```
+
+```{r render-table-3, echo=FALSE}
+# Met en forme et exporte le tableau 3
+table3_gt <- table3 |>
+  gt() |>
+  tab_header(
+    title = "City-Pair Markets with the Largest Percentage Increase in Average Fare 15% or Greater Increase",
+    subtitle = "Fourth Quarter 2025 vs. Fourth Quarter 2024"
+  ) |>
+  tab_spanner(label = "Table 3", columns = c(city1, city2)) |>
+  tab_spanner(
+    label = "Average Each Way Fare",
+    columns = c(cur_fare, ly_fare, amount_change, percent_change)
+  ) |>
+  tab_spanner(
+    label = "Passengers",
+    columns = c(
+      cur_passengers,
+      ly_passengers,
+      amount_change_pax,
+      percent_change_pax
+    )
+  ) |>
+  cols_label(
+    city1 = "City-Pair",
+    city2 = "",
+    cur_fare = "2025 q4",
+    ly_fare = "2024 q4",
+    amount_change = "Amount<br>Change",
+    percent_change = "Percent<br>Change",
+    cur_passengers = "2025 q4",
+    ly_passengers = "2024 q4",
+    amount_change_pax = "Amount<br>Change",
+    percent_change_pax = "Percent<br>Change",
+    .fn = md
+  ) |>
+  fmt_currency(
+    columns = c(cur_fare, ly_fare, amount_change),
+    currency = "USD",
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = c(percent_change, percent_change_pax),
+    scale_values = FALSE,
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(cur_passengers, ly_passengers, amount_change_pax),
+    decimals = 1,
+    sep_mark = ","
+  ) |>
+  cols_align(align = "left", columns = c(city1, city2)) |>
+  cols_align(
+    align = "center",
+    columns = c(cur_fare, ly_fare, cur_passengers, ly_passengers)
+  ) |>
+  cols_align(
+    align = "right",
+    columns = c(
+      amount_change,
+      percent_change,
+      amount_change_pax,
+      percent_change_pax
+    )
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "left"),
+    locations = list(
+      cells_column_spanners(),
+      cells_column_labels()
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(
+      cur_passengers,
+      ly_passengers,
+      amount_change_pax
+    ),
+    fns = list(TOTAL = ~ sum(., na.rm = TRUE)),
+    ~ fmt_number(., decimals = 0, sep_mark = ",")
+  ) |>
+  grand_summary_rows(
+    columns = percent_change_pax,
+    fns = list(TOTAL = ~ mean(., na.rm = TRUE)),
+    ~ fmt_percent(., decimals = 1, scale_values = FALSE, sep_mark = ".")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "right"),
+    locations = cells_grand_summary(columns = everything())
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  ) |>
+  tab_style(
+    style = cell_borders(
+      sides = c("left"),
+      weight = px(2),
+      color = "#BFBFBF"
+    ),
+    locations = list(
+      cells_body(columns = c(cur_fare, cur_passengers)),
+      cells_column_labels(columns = c(cur_fare, cur_passengers))
+    )
+  )
+
+table3_gt |> gtsave("tab3.html", path = "outputs/tables/")
+
+table3_gt
+```
+
+# Marchés origine-destination présentant les plus fortes baisses tarifaires
+```{r compute-table-4}
+# Sélectionne les marchés dont le prix moyen a diminué d'au moins 11 %
+table4 <- city_pct |>
+  filter(percent_change <= -11) |>
+  arrange(percent_change) |>
+  collect() |>
+  as.data.table()
+
+table4
+```
+
+```{r render-table-4, echo=FALSE}
+# Met en forme et exporte le tableau 4
+table4_gt <- table4 |>
+  gt() |>
+  tab_header(
+    title = "City-Pair Markets with the Largest Percentage Decrease in Average Fare 11% or Greater Decrease",
+    subtitle = "Fourth Quarter 2025 vs. Fourth Quarter 2024"
+  ) |>
+  tab_spanner(label = "Table 4", columns = c(city1, city2)) |>
+  tab_spanner(
+    label = "Average Each Way Fare",
+    columns = c(cur_fare, ly_fare, amount_change, percent_change)
+  ) |>
+  tab_spanner(
+    label = "Passengers",
+    columns = c(
+      cur_passengers,
+      ly_passengers,
+      amount_change_pax,
+      percent_change_pax
+    )
+  ) |>
+  cols_label(
+    city1 = "City-Pair",
+    city2 = "",
+    cur_fare = "2025 q4",
+    ly_fare = "2024 q4",
+    amount_change = "Amount<br>Change",
+    percent_change = "Percent<br>Change",
+    cur_passengers = "2025 q4",
+    ly_passengers = "2024 q4",
+    amount_change_pax = "Amount<br>Change",
+    percent_change_pax = "Percent<br>Change",
+    .fn = md
+  ) |>
+  fmt_currency(
+    columns = c(cur_fare, ly_fare, amount_change),
+    currency = "USD",
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = c(percent_change, percent_change_pax),
+    scale_values = FALSE,
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = c(cur_passengers, ly_passengers, amount_change_pax),
+    decimals = 1,
+    sep_mark = ","
+  ) |>
+  cols_align(align = "left", columns = c(city1, city2)) |>
+  cols_align(
+    align = "center",
+    columns = c(cur_fare, ly_fare, cur_passengers, ly_passengers)
+  ) |>
+  cols_align(
+    align = "right",
+    columns = c(
+      amount_change,
+      percent_change,
+      amount_change_pax,
+      percent_change_pax
+    )
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "left"),
+    locations = list(
+      cells_column_spanners(),
+      cells_column_labels()
+    )
+  ) |>
+  grand_summary_rows(
+    columns = c(
+      cur_passengers,
+      ly_passengers,
+      amount_change_pax
+    ),
+    fns = list(TOTAL = ~ sum(., na.rm = TRUE)),
+    ~ fmt_number(., decimals = 0, sep_mark = ",")
+  ) |>
+  grand_summary_rows(
+    columns = percent_change_pax,
+    fns = list(TOTAL = ~ mean(., na.rm = TRUE)),
+    ~ fmt_percent(., decimals = 1, scale_values = FALSE, sep_mark = ".")
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "right"),
+    locations = cells_grand_summary(columns = everything())
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  ) |>
+  tab_style(
+    style = cell_borders(
+      sides = c("left"),
+      weight = px(2),
+      color = "#BFBFBF"
+    ),
+    locations = list(
+      cells_body(columns = c(cur_fare, cur_passengers)),
+      cells_column_labels(columns = c(cur_fare, cur_passengers))
+    )
+  )
+
+table4_gt |> gtsave("tab4.html", path = "outputs/tables/")
+
+table4_gt
+```
+
+<!-- # Primes et réductions tarifaires par aéroport -->
+
+<!-- À faire -->
+
+# Références

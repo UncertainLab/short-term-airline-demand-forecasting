@@ -1,0 +1,548 @@
+---
+title: "Analyse descriptive et filtrage de la variable du prix des billets vendus : `MktFare`"
+subtitle: "Jeu de données de @bts_db1b"
+author: Alexandre Le Roux
+date: "2026/07/20 (updated: today)"
+institute: Université de Montréal
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    # code-fold: show
+    # code-tools: true
+    smooth-scroll: true
+    embed-resources: true
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  cache = FALSE
+)
+```
+
+```{r, include=FALSE}
+library(DBI)
+library(duckdb)
+library(here)
+library(fs)
+
+source(here("R", "01_ingest.R"))
+source(here("R", "02_prepare.R"))
+
+con <- dbConnect(duckdb())
+
+dbExecute(
+  con,
+  sprintf(
+    "CREATE OR REPLACE VIEW mkt AS
+     SELECT *
+     FROM read_parquet('%s', hive_partitioning = true)",
+    here("data/interim/MARKET/DB1B/**/*.parquet")
+  )
+)
+
+mkt <- tbl(con, "mkt")
+
+lookups <- load_lookups(here("data/external/") |> dir_ls(glob = "*ref_*.csv"))
+```
+
+```{r}
+mkt <- mkt |> filter(Year < 2020)
+```
+
+# Objectif du notebook
+
+L'étude de la demande aérienne origine-destination requiert de ne retenir que les observations représentatives de la demande individuelle. Un filtrage sur le prix est donc nécessaire afin d'écarter les observations qui ne relèvent pas de cette population d'intérêt : les valeurs aberrantes, les billets achetés en lots par des entreprises, les billets à prix négatif ainsi que les billets issus de programmes de fidélité.
+
+Ce notebook s'intéresse principalement à la variable quantitative continue `MktFare` et dans une moindre mesure sur la variable booléenne `BulkFare`.
+
+# Description du jeu de données
+
+Pour une description du jeu de données et des variables principales du jeu de données `DB1B` veuillez vous réferez au notebook `eda_pax`.
+
+Pour l'étude du prix la période étudiée s'étend du premier trimestre de 2000 au deuxième trimestre de 2025.
+
+```{r}
+library(dplyr)
+
+N <- mkt |> pull(MktID) |> length()
+```
+
+Le jeu de données comprend $`r N`$ observations.
+
+## Pourquoi étudier `DB1B`et pas `DB1C` ?
+
+`DB1C` est le nouveau sondage produit par le BTS qui vient remplacer `DB1B`. Il est contient certes un échantillon de 40%, au niveau d'aggrégation mensuel et contient davantage de données ($e.g$ `SchFlMo` mois où le ticket a été vendu, séparation des taxes `MktTax` et prix du billet `MktAmount`, etc.), cependant la période reportée est acctuellement insuffisante pour prédire la demande par série temporelle. Néanmoins, dans plusieurs années ce jeu de données sera à étudier pour tester des modèles de prédiction de la demande origine-destination.
+
+# Analyse de la variable qualitative `BulkFare`
+
+Dans cette section la question est la suivante : est-ce que l'on peut filter les billets vendus en lot, $i.e.$ `BulkFare == 1` sans biaiser la population observé ? En effet, la demande individuelle n'est pas représenté via les billets achetés en lots par des entreprises. Afin de s'assurer de ne pas biaiser notre échantillon de billets une étude univariée et bivarié est obligatoire.
+
+## Analyse univariée de la variable qualitative `BulkFare`
+
+Un première aperçu des effectifs de la population total est réalisé grâce à cette prmière analyse univariée.
+
+### Distribution de la population
+
+```{r}
+library(gt)
+
+res <- mkt |>
+  select(BulkFare, MktFare) |>
+  group_by(BulkFare) |>
+  summarise(
+    freq = n(),
+    min = min(MktFare, na.rm = TRUE),
+    q1 = quantile(MktFare, 0.25),
+    med = median(MktFare, na.rm = TRUE),
+    mean = mean(MktFare, na.rm = TRUE),
+    q3 = quantile(MktFare, 0.75),
+    max = max(MktFare, na.rm = TRUE),
+    sd = sd(MktFare, na.rm = TRUE)
+  ) |>
+  collect()
+
+res <- res |>
+  mutate(
+    iqr = q3 - q1,
+    var = sd^2,
+    cv = (sd / mean) * 100,
+    BulkFare = factor(BulkFare, levels = 0:1, labels = c("No", "Yes")),
+    pct = 100 * freq / sum(freq)
+  )
+```
+
+```{r, echo = FALSE}
+res |>
+  select(BulkFare, freq, pct) |>
+  gt() |>
+  tab_header(
+    title = "Répartition de la variable BulkFare",
+  ) |>
+  cols_label(
+    BulkFare = "BulkFare",
+    freq = "Effectif",
+    pct = "Pourcentage (%)",
+  ) |>
+  fmt_number(
+    columns = freq,
+    decimals = 0,
+    sep_mark = ","
+  ) |>
+  fmt_percent(
+    columns = pct,
+    scale_values = FALSE,
+    decimals = 2
+  )
+
+res |>
+  select(-c(freq, pct)) |>
+  gt() |>
+  tab_header(
+    title = "Statistiques descriptives de MktFare conditionnellement à BulkFare"
+  ) |>
+  cols_label(
+    min = "Minimum",
+    q1 = "1er<br>Quartile<br>(Q1)",
+    med = "Médiane",
+    mean = "Moyenne",
+    q3 = "3ème<br>Quartile<br>(Q3)",
+    max = "Maximum",
+    sd = "Écart-type",
+    var = "Variance",
+    cv = "Coéfficient<br>de variation (%)",
+    iqr = "Écart<br>interquartile<br>(IQR)",
+    .fn = md
+  ) |>
+  fmt_currency(
+    columns = c(min, q1, med, mean, q3, max, sd, iqr),
+    currency = "USD",
+    decimals = 1
+  ) |>
+  fmt_number(
+    columns = var,
+    decimals = 2,
+    sep_mark = ","
+  ) |>
+  fmt_percent(
+    columns = cv,
+    scale_values = FALSE,
+    decimals = 1
+  ) |>
+  cols_align(
+    align = "center",
+    columns = everything()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  )
+```
+
+Les billets achetés en lots représentent une partie infime de la population totale observé, en particulier seulement $0.03\%$. Une rapide analyse bivariée des deux variables quantitative monétaire à premièrement montré que les prix de ces billets sont tous nuls, ce qui laisse penser que ce sont des artéfacts à filtrer. **Deuxièmement, sans davantage d'information sur la collecte et la vie des données de la variable `BulkFare` dans la table `DB1B Market` elles seront systématiquement filtrées dans ce notebook ainsi que les prochains.**
+
+## Analyse bivariée entre la variable `BulkFare` et `TkCarrier`
+
+## Analyse bivariée entre la variable `BulkFare` et les variables origine-destination (OD)
+
+```{r, include = FALSE, echo = FALSE, eval = FALSE}
+# counts <- mkt |>
+#   group_by(OriginCityMarketID, BulkFare) |>
+#   summarise(
+#     n = n(),
+#     .groups = "drop"
+#   )
+
+# top10 <- counts |>
+#   filter(BulkFare == 1) |>
+#   arrange(desc(n)) |>
+#   slice_min(n = 10, order_by = desc(n)) |>
+#   select(OriginCityMarketID)
+
+# contingence_top10 <- counts |>
+#   semi_join(top10, by = "OriginCityMarketID") |>
+#   collect()
+
+# contingence_top10 <- xtabs(
+#   n ~ OriginCityMarketID + BulkFare,
+#   data = contingence_top10
+# )
+
+# contingence_top10
+```
+
+```{r, include = FALSE, echo = FALSE, eval = FALSE}
+# dist_cond <- mkt |>
+#   group_by(OriginCityMarketID, BulkFare) |>
+#   summarise(
+#     n = n(),
+#     .groups = "drop"
+#   ) |>
+#   group_by(OriginCityMarketID) |>
+#   mutate(
+#     prob = n / sum(n)
+#   ) |>
+#   ungroup() |>
+#   collect() |>
+#   as.data.table()
+
+# dist_cond
+```
+
+```{r, include = FALSE, echo = FALSE, eval = FALSE}
+set.seed(1)
+
+smp <- dbGetQuery(
+  con,
+  "
+  SELECT MktFare, Dest, Origin, BulkFare, OriginCityMarketID, DestCityMarketID, Passengers
+  FROM mkt
+  WHERE MktFare > 0
+  USING SAMPLE 200000 ROWS
+  "
+) |>
+  as.data.table() |>
+  type_market()
+```
+
+```{r, include = FALSE, echo = FALSE, eval = FALSE}
+library(ggplot2)
+
+dt <- mkt |>
+  select(
+    BulkFare,
+    MktFare,
+    Year,
+    Quarter,
+    OriginAirportID,
+    DestAirportID,
+    TkCarrier,
+    OpCarrier,
+    MktDistanceGroup
+  ) |>
+  filter(BulkFare == 1) |>
+  collect() |>
+  mutate(
+    BulkFare = factor(
+      BulkFare,
+      levels = 0:1,
+      labels = c("No", "Yes")
+    )
+  ) |>
+  ggplot(aes(x = MktFare, fill = BulkFare)) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Distribution des prix selon BulkFare",
+    x = "Prix du marché",
+    y = "Densité"
+  ) +
+  theme_minimal()
+
+dt
+```
+
+```{r}
+stats_fare <- mkt |>
+  summarise(
+    min = min(MktFare, na.rm = TRUE),
+    max = max(MktFare, na.rm = TRUE),
+    mean = mean(MktFare, na.rm = TRUE),
+    med = median(MktFare, na.rm = TRUE),
+    sd = sd(MktFare, na.rm = TRUE)
+  ) |>
+  collect()
+
+stats_fare |>
+  gt() |>
+  tab_header(
+    title = "Statistiques descriptives de MktFare"
+  ) |>
+  cols_label(
+    min = "Minimum",
+    med = "Médiane",
+    mean = "Moyenne",
+    max = "Maximum",
+    .fn = md
+  ) |>
+  fmt_currency(
+    columns = c(min, med, mean, max, sd),
+    currency = "USD",
+    decimals = 1
+  ) |>
+  cols_align(
+    align = "center",
+    columns = everything()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  )
+```
+
+```{r}
+stats <- mkt |>
+  filter(MktFare > 0, BulkFare == 0) |>
+  summarise(
+    avg = mean(MktFare, na.rm = TRUE),
+    std = sd(MktFare, na.rm = TRUE),
+    skew = skewness(MktFare),
+    exkurt = kurtosis(MktFare),
+    o1 = sql("approx_quantile(MktFare, 0.125)"),
+    q1 = sql("approx_quantile(MktFare, 0.25)"),
+    o3 = sql("approx_quantile(MktFare, 0.375)"),
+    med = sql("approx_quantile(MktFare, 0.50)"),
+    o5 = sql("approx_quantile(MktFare, 0.625)"),
+    q3 = sql("approx_quantile(MktFare, 0.75)"),
+    o7 = sql("approx_quantile(MktFare, 0.875)"),
+    log_avg = mean(log(MktFare)),
+    log_std = sd(log(MktFare)),
+    log_skew = skewness(log(MktFare)),
+    log_exkurt = kurtosis(log(MktFare)),
+    log_o1 = sql("approx_quantile(log(MktFare), 0.125)"),
+    log_q1 = sql("approx_quantile(log(MktFare), 0.25)"),
+    log_o3 = sql("approx_quantile(log(MktFare), 0.375)"),
+    log_med = sql("approx_quantile(log(MktFare), 0.50)"),
+    log_o5 = sql("approx_quantile(log(MktFare), 0.625)"),
+    log_q3 = sql("approx_quantile(log(MktFare), 0.75)"),
+    log_o7 = sql("approx_quantile(log(MktFare), 0.875)")
+  ) |>
+  collect()
+
+stats
+```
+
+Soit $smp$ un échantillon aléatoire de $200000$ observations correspondant au prix des billets vendus.
+
+```{r}
+set.seed(42)
+
+smp <- dbGetQuery(
+  con,
+  "
+  SELECT MktFare
+  FROM mkt
+  WHERE MktFare > 0
+    AND BulkFare = 0
+    AND Year < 2020
+  USING SAMPLE 200000 ROWS
+  "
+)
+
+smp <- smp |> mutate(log_MktFare = log(MktFare)) |> select(log_MktFare)
+```
+
+```{r}
+glimpse(smp)
+```
+
+Afin d'examiner la distribution de l'échantillon $smp$, un Q-Q plot et un histogramme sont tracés.
+
+```{r, echo = FALSE}
+library(patchwork)
+library(scales)
+
+qq <- ggplot(smp, aes(sample = log_MktFare)) +
+  stat_qq(alpha = 0.1) +
+  stat_qq_line() +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+hist <- ggplot(smp, aes(x = log_MktFare)) +
+  geom_histogram(bins = 50, binwidth = 0.05) +
+  scale_y_continuous(labels = comma) +
+  labs(x = "log(MktFare)", y = "Count")
+
+(qq | hist)
+
+rm(qq, hist)
+```
+
+Les nombreux plateaux observés dans la partie gauche du Q-Q plot suggèrent la présence de plusieurs modes dans la distribution des prix des billets. Cette observation est corroborée par l'histogramme, qui met en évidence une distribution bimodale.
+
+Il est toutefois important de remarquer que la composante située à gauche est négligeable en termes d'effectifs par rapport à celle de droite. Cette observation est attendue : `DB1B` contient des billets issus de programmes de fidélité. La population située à gauche correspond donc vraisemblablement aux taxes et frais associés aux billets obtenus dans le cadre de ces programmes. Son faible effectif s'explique probablement par la faible proportion de billets émis au moyen de programmes de fidélité.
+
+Soient $(X_1,\ldots,X_n)$ des variables aléatoires indépendantes et identiquement distribuées ($i.i.d.$) de fonction de répartition commune $F$. Pour évaluer statistiquement cette bimodalité l'hypothèse nulle du *Hartigan's Dip Test* est considérée :
+
+$H_0 : F \text{ est une distribution unimodale}$ contre $H_1 : F \text{ n'est pas unimodale}$.
+
+```{r}
+library(diptest)
+
+smp |> pull(log_MktFare) |> dip.test()
+```
+
+La p-valeur correspondante au test de nullité de Hartigan's Dip est $\lt 2.2e^{-16}$, en particulier plus petite que $0.05$. On peut donc rejeter l'hypothèse que la distribution est unimodal, c'est-à-dire que la distribution du prix des billets vendus est significativement bimodale ou multimodale. Au regard du domaine de définition du prix et de la remarque précédente, on supposera par la suite que cette distribution est bimodale.
+
+La statistique « *Dip* » qui mesure la déviation de la distribution étudiée à une distribution unimodal, est relativement faible, de l'ordre de $0.01$. Cette valeur s'explique par la grande taille du jeu de données ainsi que par le déséquilibre marqué entre les variances et les effectifs des deux populations.
+
+# Filtre des billets obtenu grâce à des programmes fidélité
+
+```{r, echo = FALSE}
+library(mclust)
+
+fit <- Mclust(smp$log_MktFare, G = 2)
+
+summary(fit)
+
+ordre <- order(fit$parameters$mean)
+
+mu <- fit$parameters$mean[ordre]
+sd <- sqrt(fit$parameters$variance$sigmasq)[ordre]
+pi <- fit$parameters$pro[ordre]
+
+mu1 <- mu[1]
+mu2 <- mu[2]
+
+sd1 <- sd[1]
+sd2 <- sd[2]
+
+pi1 <- pi[1]
+pi2 <- pi[2]
+```
+
+D'après la librairie `mclust` qui utilise l'algorithme Expectation-Maximization (EM) :
+$$
+smp \sim `r pi1` \cdot \mathcal{N}(`r mu1`,\,`r sd1`^{2}) + (1-`r pi2`) \cdot \mathcal{N}(`r mu2`,\,`r sd2`^{2})
+$$
+
+```{r}
+dens.diff <- function(x) {
+  pi1 * dnorm(x, mu1, sd1) - pi2 * dnorm(x, mu2, sd2)
+}
+
+thr.lower <- uniroot(
+  dens.diff,
+  lower = mu1,
+  upper = mu2
+)$root
+
+thr.lower
+
+smp.study <- smp |> filter(log_MktFare >= thr.lower)
+```
+
+```{r}
+post <- fit$z[, ordre]
+prob.upper <- post[, 2]
+
+thr.lower.post <- min(smp$log_MktFare[prob.upper >= 0.95])
+
+thr.lower.post
+
+smp.study.post <- smp |> filter(log_MktFare >= thr.lower.post)
+```
+
+```{r}
+Q1 <- quantile(smp.study$log_MktFare, 0.25)
+Q3 <- quantile(smp.study$log_MktFare, 0.75)
+
+thr.upper.IQR <- Q3 + 1.5 * (Q3 - Q1)
+
+smp.study.IQR <- smp.study |> filter(log_MktFare <= thr.upper.IQR)
+```
+
+```{r}
+Q1.post <- quantile(smp.study.post$log_MktFare, 0.25)
+Q3.post <- quantile(smp.study.post$log_MktFare, 0.75)
+
+thr.upper.post.IQR <- Q3.post + 1.5 * (Q3.post - Q1.post)
+
+smp.study.post.IQR <- smp.study.post |>
+  filter(log_MktFare <= thr.upper.post.IQR)
+```
+
+```{r}
+med <- median(smp.study$log_MktFare)
+
+MAD <- mad(smp.study$log_MktFare)
+
+smp.study.MAD <- smp.study |> filter((log_MktFare - med) / MAD <= 3.5)
+```
+
+```{r}
+med.post <- median(smp.study.post$log_MktFare)
+
+MAD.post <- mad(smp.study.post$log_MktFare)
+
+smp.study.post.MAD <- smp.study.post |>
+  filter((log_MktFare - med.post) / MAD.post <= 3.5)
+```
+
+```{r}
+resume_dist <- function(data, methode, population) {
+  data |>
+    summarise(
+      Méthode = methode,
+      Population = population,
+      N = n(),
+      Min = min(log_MktFare),
+      Q1 = quantile(log_MktFare, .25),
+      Médiane = median(log_MktFare),
+      Moyenne = mean(log_MktFare),
+      Q3 = quantile(log_MktFare, .75),
+      Max = max(log_MktFare)
+    )
+}
+
+resume <- bind_rows(
+  resume_dist(smp.study.IQR, "IQR", "Avant"),
+  resume_dist(smp.study.post.IQR, "IQR", "Après"),
+  resume_dist(smp.study.MAD, "MAD", "Avant"),
+  resume_dist(smp.study.post.MAD, "MAD", "Après")
+)
+
+resume |>
+  gt(groupname_col = "Méthode") |>
+  fmt_number(where(is.numeric), decimals = 2)
+```
+
+# Références

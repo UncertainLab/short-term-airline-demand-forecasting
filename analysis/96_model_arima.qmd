@@ -1,0 +1,555 @@
+---
+title: "Modélisation et prédiction de la demande"
+subtitle: "Jeux de données de @bureauoftransportationstatisticsOriginDestinationSurvey2025"
+author: Alexandre Le Roux
+date: "2026/07/22"
+institute: Université de Montréal
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    # code-fold: show
+    # code-tools: true
+    smooth-scroll: true
+    embed-resources: true
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  cache = FALSE
+)
+```
+
+```{r load-db1b, include=FALSE}
+library(DBI)
+library(duckdb)
+library(here)
+library(fs)
+library(dbplyr)
+
+source(here("R", "01_ingest.R"))
+source(here("R", "02_prepare.R"))
+
+con <- dbConnect(duckdb())
+
+# Lecture de la table de données des marchés DB1B
+dbExecute(
+  con,
+  sprintf(
+    "CREATE OR REPLACE VIEW mkt AS
+     SELECT *
+     FROM read_parquet('%s', hive_partitioning = true)",
+    here("data/interim/MARKET/DB1B/**/*.parquet")
+  )
+)
+
+mkt <- tbl(con, "mkt")
+
+# Création du vecteur nommé des différentes tables de référence
+lookups <- load_lookups(
+  here("data/external/refs/") |> dir_ls(glob = "*ref_*.csv")
+)
+```
+
+# Aperçu du jeu de données
+```{r glimpse-mkt}
+# Affiche un aperçu de la table des marchés DB1C
+glimpse(mkt)
+```
+
+# Création des séries temporelles du nombre de passagers et du PIB
+```{r mkt-as-tsibble}
+library(tsibble)
+
+# Nettoyage des données et agrégation du nombre estimé de passagers
+db1b <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare <= exp(10),
+    MktFare >= exp(2.87),
+    Passengers > 0,
+    MktDistance > 0,
+    MktCoupons < 4,
+    OriginCityMarketID != DestCityMarketID,
+    BulkFare == 0,
+    # Restreint le marché considéré
+    # OriginCityMarketID %in% c(32575, 32457), # 32575 : Los Angeles, CA (Metropolitan Area) et 32457 : San Francisco, CA (Metropolitan Area)
+    # DestCityMarketID %in% c(32575, 32457),
+    MktGeoType == 2
+  ) |>
+  group_by(Year, Quarter) |>
+  summarise(
+    pax = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Transformation de la table de données en série temporelle
+db1b <- db1b |>
+  mutate(
+    period = yearquarter(sprintf("%d Q%d", Year, Quarter))
+  ) |>
+  select(-Year, -Quarter) |>
+  as_tsibble(index = period)
+
+# Sélection de la période étudiée
+db1b <- db1b |> filter_index("2000 Q1" ~ "2019 Q4")
+```
+
+```{r load-gdpc1}
+# Lecture des données du PIB GDPC1 et transformation au logarithme
+gdp <- read.csv("data/external/regressors/GDPC1.csv") |>
+  mutate(
+    date = as.Date(observation_date),
+    lgdpc = log(as.numeric(GDPC1))
+  )
+
+# Transformation des données en série temporelle
+gdp <- gdp |>
+  select(date, lgdpc) |>
+  mutate(period = yearquarter(date)) |>
+  select(-date) |>
+  as_tsibble(index = period)
+
+# Jointure avec la série temporelle des marchés DB1B
+db1b <- db1b |> left_join(gdp, by = "period")
+```
+
+```{r plot-lpax}
+library(ggplot2)
+library(scales)
+
+# Trace le logarithme du nombre de passagers selon les années et les trimestres
+ggplot(db1b) +
+  aes(x = period, y = log(pax)) +
+  geom_line() +
+  scale_x_yearquarter(
+    breaks = seq(
+      yearquarter("2000 Q1"),
+      yearquarter("2020 Q1"),
+      by = 8
+    ),
+    labels = function(x) format(x, "%Y T%q")
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    x = "Période (en trimestre)",
+    y = "Log(Nombre de passagers)"
+  ) +
+  theme_minimal()
+```
+
+```{r render-lpax, echo=FALSE}
+ggsave("outputs/figs/fig_model-pax.pdf", width = 8, height = 5)
+```
+
+# Sélection des paramètres du processus ARIMA(p, d, q)(P, D, Q) et de la saisonnalité m
+```{r plot-seasonality}
+library(ggtime)
+library(patchwork)
+library(feasts)
+library(tidyr)
+
+# Trace le diagnostic de la saisonnalité du logarithme du nombre de passagers
+intra <- db1b |>
+  mutate(lpax = log(pax)) |>
+  gg_subseries(lpax) +
+  labs(x = "", y = "Log(Nombre de passagers) (en millions)")
+
+# Décompose le logarithme du nombre de passagers pour obtenir la tendance
+# (trend), la saisonnalité (season_year) et les résidus innovants
+dcmp <- db1b |>
+  mutate(lpax = log(pax)) |>
+  model(STL(lpax)) |>
+  components()
+
+# Trace la composante saisonnière du logarithme du nombre de passagers
+inter <- dcmp |>
+  ggplot(aes(x = period, y = season_year)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  scale_x_yearquarter(
+    breaks = seq(
+      yearquarter("2000 Q1"),
+      yearquarter("2020 Q1"),
+      by = 8
+    ),
+    labels = function(x) format(x, "%Y T%q")
+  ) +
+  labs(
+    y = "Composante saisonnière \n de Log(Nombre de passagers) (en millions)"
+  )
+```
+
+```{r render-seasonality, echo=FALSE}
+(intra / inter) +
+  xlab("Période (en trimestre)") +
+  plot_layout(axis_titles = "collect")
+
+ggsave("outputs/figs/fig_model-seasonality.pdf", width = 8, height = 5)
+```
+
+```{r plot-trend}
+# Trace la composante tendancielle du logarithme du nombre de passagers
+dcmp |>
+  ggplot(aes(x = period, y = trend)) +
+  geom_line() +
+  scale_x_yearquarter(
+    breaks = seq(
+      yearquarter("2000 Q1"),
+      yearquarter("2020 Q1"),
+      by = 8
+    ),
+    labels = function(x) format(x, "%Y T%q")
+  ) +
+  labs(
+    x = "Période (en trimestre)",
+    y = "Log(Nombre de passagers) (en millions)"
+  )
+```
+
+```{r render-trend, echo=FALSE}
+ggsave("outputs/figs/fig_model-trend.pdf", width = 8, height = 5)
+```
+
+```{r plot-seasonal-diff}
+# Trace la première différence saisonnière (m = 4) du logarithme du nombre
+# de passagers, accompagnée des ACF et PACF associées
+.fig <- db1b |>
+  select(period, pax) |>
+  gg_tsdisplay(difference(log(pax), 4), plot_type = 'partial', lag = 24) +
+  labs(y = "")
+```
+
+```{r print-seasonal-diff, echo=FALSE}
+# Ouverture du périphérique graphique PDF
+pdf(
+  "outputs/figs/fig_model-acf-pacf-sea.pdf",
+  width = 8,
+  height = 6
+)
+
+print(.fig)
+
+# Fermeture du périphérique graphique PDF
+dev.off()
+
+.fig
+```
+
+```{r plot-seasonal-first-diff}
+# Trace la différence non saisonnière du premier ordre de la première
+# différence saisonnière (m = 4) du logarithme du nombre de passagers,
+# accompagnée des ACF et PACF associées
+.fig <- db1b |>
+  select(period, pax) |>
+  gg_tsdisplay(
+    difference(log(pax), 4) |> difference(),
+    plot_type = "partial",
+    lag = 24
+  ) +
+  labs(y = "")
+```
+
+```{r print-seasonal-first-diff, echo=FALSE}
+# Ouverture du périphérique graphique PDF
+pdf(
+  "outputs/figs/fig_model-acf-pacf-all.pdf",
+  width = 8,
+  height = 6
+)
+
+print(.fig)
+
+# Fermeture du périphérique graphique PDF
+dev.off()
+
+.fig
+```
+
+# Création de l'ensemble d'entraînement
+```{r set-train}
+library(fable)
+
+# Déclare les ensembles d'entraînement pour la validation croisée
+train <- db1b |>
+  # mutate(sta_pax = difference(difference(log(pax), 4), 1)) |>
+  # filter(!is.na(sta_pax)) |>
+  filter_index("2003 Q1" ~ "2018 Q4") |>
+  # 56 représente le nombre de trimestres entre 2003 Q1 et 2017 Q4, puis 4
+  # représente le nombre de trimestres dans une année
+  stretch_tsibble(.init = 60, .step = 4)
+```
+
+```{r render-train, echo=FALSE}
+# Affiche le nombre de passagers, la période et le PIB par observation selon
+# le groupe d'entraînement
+train
+```
+
+# Estimation et validation statistique du modèle
+```{r estimate-models}
+# Estime le logarithme du nombre de passagers selon les différents modèles
+# considérés
+fit <- train |>
+  model(
+    arima010011 = ARIMA(log(pax) ~ pdq(0, 1, 0) + PDQ(0, 1, 1)),
+    auto = ARIMA(log(pax)),
+    autogdp = ARIMA(log(pax) ~ lgdpc)
+  )
+
+# Récapitule les noms et paramètres des différents modèles estimés sur le
+# dernier groupe d'entraînement
+.sum <- fit |>
+  filter(.id == max(.id)) |>
+  select(-.id) |>
+  pivot_longer(
+    everything(),
+    names_to = "model",
+    values_to = "orders"
+  )
+```
+
+```{r save-estimate-models, echo=FALSE}
+# Enregistrement du récapitulatif
+capture.output(
+  .sum,
+  file = "outputs/reports/sum_model-orders.txt"
+)
+
+.sum
+```
+
+```{r rank-models}
+# Classe les différents modèles estimés selon le critère de sélection AICc.
+# Attention, les modèles estimés peuvent ne pas être comparables selon le
+# nombre de différenciations
+.sum <- glance(fit) |>
+  filter(.id == max(.id)) |>
+  arrange(AICc) |>
+  select(.model:BIC)
+```
+
+```{r save-rank-models, echo=FALSE}
+# Enregistrement du récapitulatif
+capture.output(
+  .sum,
+  file = "outputs/reports/sum_model-ranks.txt"
+)
+
+.sum
+```
+
+```{r report-best-model}
+# Récapitule les paramètres estimés du modèle autogdp
+.sum <- fit |>
+  filter(.id == max(.id)) |>
+  select(autogdp) |>
+  report()
+```
+
+```{r save-report-best-model, echo=FALSE}
+# Enregistrement du récapitulatif
+capture.output(
+  .sum,
+  file = "outputs/reports/sum_model-best-model.txt"
+)
+
+.sum
+```
+
+```{r plot-best-model-residuals}
+# Trace les graphiques de diagnostic des résidus innovants du modèle autogdp
+.fig <- fit |>
+  filter(.id == max(.id)) |>
+  select(autogdp) |>
+  gg_tsresiduals(lag = 50)
+```
+
+```{r print-best-model-residuals, echo=FALSE}
+# Ouverture du périphérique graphique PDF
+pdf(
+  "outputs/figs/fig_model-inov.pdf",
+  width = 8,
+  height = 6
+)
+
+print(.fig)
+
+# Fermeture du périphérique graphique PDF
+dev.off()
+
+.fig
+```
+
+```{r test-ljung-box}
+# Vérifie statistiquement que les résidus du modèle autogdp ne présentent
+# plus d'autocorrélation significative à l'aide du test de Ljung-Box
+.sum <- fit |>
+  filter(.id == max(.id)) |>
+  augment() |>
+  filter(.model == "autogdp") |>
+  features(.innov, ljung_box, lag = 8, dof = 4)
+```
+
+```{r save-test-ljung-box, echo=FALSE}
+# Enregistrement du récapitulatif
+capture.output(
+  .sum,
+  file = "outputs/reports/sum_model-ljung_box.txt"
+)
+
+.sum
+```
+
+# Prédiction du nombre de passagers pour l'année 2019
+```{r plot-forecast-best-model}
+# Récupère les observations de la variable explicative lgdpc (PIB) pour
+# prédire la demande de l'année 2019 (n = 4)
+future <- new_data(train, n = 4) |>
+  left_join(
+    gdp |>
+      select(period, lgdpc),
+    by = "period"
+  )
+
+# Trace les prédictions du nombre de passagers pour l'année 2019 et les
+# observations réalisées de 2015 T1 à 2019 T4
+fit |>
+  select(autogdp) |>
+  forecast(new_data = future) |>
+  filter(.id == max(.id)) |>
+  autoplot() +
+  geom_line(
+    data = db1b |> filter_index("2015 Q1" ~ "2019 Q4"),
+    aes(x = period, y = pax)
+  ) +
+  scale_x_yearquarter(
+    breaks = seq(
+      yearquarter("2015 Q1"),
+      yearquarter("2020 Q1"),
+      by = 4
+    ),
+    labels = function(x) format(x, "%Y T%q")
+  ) +
+  scale_y_continuous(
+    labels = function(x) x / 1e6
+  ) +
+  labs(
+    x = "Période (en trimestres)",
+    y = "Nombre de passagers (en millions)"
+  )
+```
+
+```{r render-forecast-best-model, echo=FALSE}
+ggsave("outputs/figs/fig_model-forecast.pdf", width = 8, height = 5)
+```
+
+# Évaluation des erreurs du modèle
+```{r best-model-metrics}
+library(ggh4x)
+
+# Récupère les prévisions du nombre de passagers pour l'année 2019 selon les
+# horizons des groupes d'entraînement
+fc <- fit |>
+  select(autogdp) |>
+  forecast(new_data = future) |>
+  group_by(.id, .model) |>
+  mutate(h = row_number()) |>
+  ungroup() |>
+  as_fable(
+    response = "pax",
+    distribution = pax
+  )
+
+# Calcule les mesures d'erreur MAE, MAPE, MASE, RMSE et RMSSE du modèle
+# autogdp
+.sum <- bind_rows(
+  fit |> accuracy(),
+  fc |> accuracy(db1b)
+) |>
+  filter(.type == "Test") |>
+  select(-any_of(c(".id", "ME", "MPE", "ACF1"))) |>
+  arrange(RMSE)
+
+accuracy <- fc |>
+  accuracy(
+    db1b,
+    by = c("h", ".model")
+  ) |>
+  select(
+    h,
+    .model,
+    RMSE,
+    MAE,
+    MAPE,
+    MASE,
+    RMSSE
+  ) |>
+  pivot_longer(
+    cols = c(RMSE, MAE, MAPE, MASE, RMSSE),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+# Trace les mesures d'erreur
+accuracy |>
+  ggplot(aes(x = h, y = value, color = .model)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~metric, scales = "free_y") +
+  facetted_pos_scales(
+    y = list(
+      metric == "RMSE" ~ scale_y_continuous(
+        labels = label_number(scale = 1e-6, suffix = " M")
+      ),
+      metric == "MAE" ~ scale_y_continuous(
+        labels = label_number(scale = 1e-6, suffix = " M")
+      ),
+      metric == "MAPE" ~ scale_y_continuous(
+        labels = label_number(suffix = " %")
+      ),
+      metric == "MASE" ~ scale_y_continuous(),
+      metric == "RMSSE" ~ scale_y_continuous()
+    )
+  ) +
+  scale_x_continuous(
+    breaks = 1:4,
+    labels = paste0("T", 1:4)
+  ) +
+  labs(
+    x = "Horizon de prédiction (en trimestres)",
+    y = "",
+    color = "Modèle"
+  ) +
+  theme_minimal()
+```
+
+```{r save-best-model-metrics, echo=FALSE}
+# Enregistrement du récapitulatif
+capture.output(
+  .sum,
+  file = "outputs/reports/sum_model-metrics.txt"
+)
+
+.sum
+```
+
+```{r render-best-model-metrics, echo=FALSE}
+ggsave("outputs/figs/fig_model-metrics.pdf", width = 8, height = 5)
+```

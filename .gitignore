@@ -1,6 +1,47 @@
+# R history and session
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+.Rprofile
+.Rapp.history
+**/**.Rhistory
+
+# Mac finder metadata
+.DS_Store
+**/**.DS_Store
+
+# Reference files
 papers/
-data/raw/DB1C/
+
+# Internship files
+internship-report/
+
+# Data
+data/raw/*
+!data/raw/.gitkeep
+
+data/interim/*
+!data/interim/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+
+# Quarto meta files
+.quarto/
+**/**.quarto_ipynb
+
+# Outputs
+outputs/figs/*
+!outputs/figs/.gitkeep
+
+outputs/html/*
+!outputs/html/.gitkeep
+
+outputs/reports/*
+!outputs/reports/.gitkeep
+
+outputs/tabs/*
+!outputs/tabs/.gitkeep
+/.quarto/
+**/*.quarto_ipynb

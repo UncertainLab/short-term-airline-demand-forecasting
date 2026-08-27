@@ -1,0 +1,1159 @@
+---
+title: "Analyse exploratoire et descriptive du jeu de données de @bureauoftransportationstatisticsOriginDestinationSurvey2025"
+author: Alexandre Le Roux
+date: "2026/07/13"
+institute: Université de Montréal
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    # code-fold: show
+    # code-tools: true
+    smooth-scroll: true
+    embed-resources: true
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  cache = FALSE
+)
+```
+
+```{r load-db1b, include=FALSE}
+library(DBI)
+library(duckdb)
+library(here)
+library(fs)
+library(gt)
+
+dir_create("outputs/figs")
+dir_create("outputs/tabs")
+
+source(here("R", "01_ingest.R"))
+source(here("R", "02_prepare.R"))
+
+con <- dbConnect(duckdb())
+
+# Lecture de la table de données des marchés DB1B
+dbExecute(
+  con,
+  sprintf(
+    "CREATE OR REPLACE VIEW mkt AS
+     SELECT *
+     FROM read_parquet('%s', hive_partitioning = true)",
+    here("data/interim/MARKET/DB1B/**/*.parquet")
+  )
+)
+
+mkt <- tbl(con, "mkt")
+
+# Création du vecteur nommé des différentes tables de référence
+lookups <- load_lookups(
+  here("data/external/refs/") |> dir_ls(glob = "*ref_*.csv")
+)
+```
+
+```{r filter-period}
+# Sélection de la période étudiée
+mkt <- mkt |> filter(Year < 2020)
+```
+
+```{r glimpse-mkt}
+# Aperçu de la table de données des marchés DB1B
+glimpse(mkt)
+```
+
+```{r weighted-functions}
+# Déclaration des fonctions de calcul des statistiques pondérées
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+
+weighted_quantile <- function(x, w, probs = c(0.25, 0.5, 0.75)) {
+  keep <- !is.na(x) & !is.na(w) & w > 0
+
+  x <- x[keep]
+  w <- w[keep]
+
+  ord <- order(x)
+  x <- x[ord]
+  w <- w[ord]
+
+  cw <- cumsum(w) / sum(w)
+
+  sapply(
+    probs,
+    \(p) x[which(cw >= p)[1]]
+  )
+}
+
+weighted_stats <- function(x, w) {
+  q <- weighted_quantile(x, w)
+
+  tibble(
+    Minimum = min(x, na.rm = TRUE),
+    Q1 = q[1],
+    Médiane = q[2],
+    Moyenne = weighted.mean(x, w, na.rm = TRUE),
+    Q3 = q[3],
+    Maximum = max(x, na.rm = TRUE)
+  )
+}
+```
+
+# Caractéristiques générales de la table de données DB1B
+
+```{r compute-general-characteristics}
+# Calcul des caractéristiques générales du jeu de données
+general_stats <- mkt |>
+  summarise(
+    first_period = min(Year * 4 + Quarter, na.rm = TRUE),
+    last_period = max(Year * 4 + Quarter, na.rm = TRUE),
+    rows = n(),
+    passengers = sum(Passengers * 10, na.rm = TRUE)
+  ) |>
+  collect()
+
+origins <- mkt |>
+  select(OriginCityMarketID) |>
+  distinct() |>
+  summarise(origins = n()) |>
+  collect() |>
+  pull(origins)
+
+destinations <- mkt |>
+  select(DestCityMarketID) |>
+  distinct() |>
+  summarise(destinations = n()) |>
+  collect() |>
+  pull(destinations)
+
+markets <- mkt |>
+  select(OriginCityMarketID, DestCityMarketID) |>
+  filter(OriginCityMarketID != DestCityMarketID) |>
+  distinct() |>
+  summarise(markets = n()) |>
+  collect() |>
+  pull(markets)
+
+carriers <- mkt |>
+  select(TkCarrier) |>
+  distinct() |>
+  summarise(carriers = n()) |>
+  collect() |>
+  pull(carriers)
+
+period_label <- function(x) {
+  year <- (x - 1) %/% 4
+  quarter <- (x - 1) %% 4 + 1
+
+  paste0(year, " T", quarter)
+}
+```
+
+```{r render-general-characteristics, echo=FALSE}
+table_general <- tibble(
+  Caractéristique = c(
+    "Première période",
+    "Dernière période",
+    "Nombre de lignes",
+    "Nombre de passagers",
+    "Nombre d'origines",
+    "Nombre de destinations",
+    "Nombre de marchés OD",
+    "Nombre de transporteurs"
+  ),
+  Valeur = c(
+    period_label(general_stats$first_period),
+    period_label(general_stats$last_period),
+    comma(general_stats$rows),
+    comma(general_stats$passengers),
+    comma(origins),
+    comma(destinations),
+    comma(markets),
+    comma(carriers)
+  )
+)
+
+table_general_gt <- table_general |>
+  gt() |>
+  cols_label(
+    Caractéristique = "Caractéristique",
+    Valeur = "Valeur"
+  ) |>
+  cols_align(align = "left", columns = Caractéristique) |>
+  cols_align(align = "right", columns = Valeur) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+table_general_gt |> gtsave("tab_eda-general.html", path = "outputs/tabs/")
+
+table_general_gt
+```
+
+```{r compute-missing-values}
+# Calcul du nombre de valeurs manquantes des principales variables
+missing <- mkt |>
+  summarise(
+    origin = sum(is.na(OriginCityMarketID)),
+    dest = sum(is.na(DestCityMarketID)),
+    carrier = sum(is.na(TkCarrier)),
+    passengers = sum(is.na(Passengers)),
+    fare = sum(is.na(MktFare)),
+    distance = sum(is.na(MktDistance)),
+    flmiles = sum(is.na(MktMilesFlown)),
+    coupons = sum(is.na(MktCoupons))
+  ) |>
+  collect()
+```
+
+```{r render-missing-values, echo=FALSE}
+missing_gt <- missing |>
+  gt() |>
+  cols_label(
+    origin = "Origines",
+    dest = "Destinations",
+    carrier = "Transporteurs",
+    passengers = "Passagers",
+    fare = "Prix du billet",
+    distance = "Distance",
+    flmiles = "Miles parcourus",
+    coupons = "Coupons"
+  ) |>
+  fmt_number(columns = everything(), decimals = 0, sep_mark = ",") |>
+  cols_align(align = "center", columns = everything()) |>
+  tab_style(
+    style = cell_text(weight = "bold", align = "center"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+missing_gt |> gtsave("tab_eda-missing.html", path = "outputs/tabs/")
+
+missing_gt
+```
+
+```{r compute-annual-markets}
+# Calcul du nombre de marchés origine-destination par année
+annual_markets <- mkt |>
+  select(
+    Year,
+    OriginCityMarketID,
+    DestCityMarketID
+  ) |>
+  filter(
+    !is.na(OriginCityMarketID),
+    !is.na(DestCityMarketID),
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  distinct() |>
+  summarise(
+    markets = n(),
+    .by = Year
+  ) |>
+  collect() |>
+  arrange(Year)
+```
+
+```{r render-annual-markets, echo=FALSE}
+# Trace l'évolution du nombre de marchés origine-destination par année
+ggplot(annual_markets, aes(x = Year, y = markets)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = seq(2000, 2020, by = 2)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    x = "Année",
+    y = "Nombre de marchés origine-destination"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-market.pdf", width = 8, height = 5)
+```
+
+```{r compute-annual-characteristics}
+# Calcul du nombre de passagers par année
+annual_passengers <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  group_by(Year) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul du prix moyen du billet par année
+# Calcul du prix moyen pondéré du billet par année
+annual_fare <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  group_by(Year) |>
+  summarise(
+    fare = sum(MktFare * Passengers, na.rm = TRUE) /
+      sum(Passengers, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Regroupement du nombre de passagers et du prix moyen du billet par année
+annual_stats <- annual_passengers |> left_join(annual_fare, by = "Year")
+```
+
+```{r render-annual-characteristics, echo=FALSE}
+# Trace l'évolution annuelle du nombre de passagers et du prix moyen du billet
+ggplot(annual_stats, aes(x = Year, y = passengers)) +
+  geom_col(fill = "gray50") +
+  scale_y_continuous(labels = label_number(scale = 1e-6)) +
+  scale_x_continuous(breaks = seq(2000, 2020, by = 2)) +
+  labs(
+    x = "Année",
+    y = "Nombre de passagers \n (en millions)"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-pax-bar.pdf", width = 8, height = 2.5)
+
+ggplot(annual_stats, aes(x = Year, y = fare)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = seq(2000, 2020, by = 2)) +
+  labs(
+    x = "Année",
+    y = "Prix du billet moyen \n (en dollars américains)"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-pax-fare.pdf", width = 8, height = 2.5)
+```
+
+# Caractéristiques du prix et du yield
+
+```{r compute-fare-yield-characteristics}
+# Calcul des statistiques pondérées du prix du billet et du yield
+fare_dist <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    Passengers > 0
+  ) |>
+  group_by(MktFare) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul de la distribution pondérée du yield
+yield_dist <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(MktMilesFlown),
+    MktMilesFlown > 0,
+    !is.na(Passengers),
+    Passengers > 0
+  ) |>
+  mutate(
+    yield = MktFare / MktMilesFlown
+  ) |>
+  group_by(yield) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+```
+
+```{r render-fare-yield-characteristics, echo=FALSE}
+# Regroupement des statistiques pondérées du prix du billet et du yield
+table_fare_yield <- bind_rows(
+  weighted_stats(fare_dist$MktFare, fare_dist$passengers) |>
+    mutate(Variable = "Prix du billet"),
+  weighted_stats(yield_dist$yield, yield_dist$passengers) |>
+    mutate(Variable = "Yield")
+) |>
+  select(Variable, everything())
+
+table_fare_yield_gt <- table_fare_yield |>
+  gt() |>
+  fmt_number(
+    columns = c(Minimum, Q1, Médiane, Moyenne, Q3, Maximum),
+    decimals = 2,
+    sep_mark = ","
+  ) |>
+  cols_align(align = "left", columns = Variable) |>
+  cols_align(
+    align = "right",
+    columns = c(Minimum, Q1, Médiane, Moyenne, Q3, Maximum)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+table_fare_yield_gt |> gtsave("tab_eda-fare-yield.html", path = "outputs/tabs/")
+
+table_fare_yield_gt
+```
+
+```{r compute-quarter-characteristics}
+# Calcul des statistiques descriptives selon le trimestre
+quarter_passengers <- mkt |>
+  group_by(Quarter) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul du prix moyen pondéré selon le trimestre
+quarter_fare <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers)
+  ) |>
+  group_by(Quarter) |>
+  summarise(
+    fare = sum(MktFare * Passengers, na.rm = TRUE) /
+      sum(Passengers, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul du yield moyen pondéré selon le trimestre
+quarter_yield <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(MktMilesFlown),
+    MktMilesFlown > 0,
+    !is.na(Passengers)
+  ) |>
+  mutate(
+    yield = MktFare / MktMilesFlown
+  ) |>
+  group_by(Quarter) |>
+  summarise(
+    yield = sum(yield * Passengers, na.rm = TRUE) /
+      sum(Passengers, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul de la distribution pondérée du prix du billet selon le trimestre
+quarter_fare_dist <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    Passengers > 0
+  ) |>
+  group_by(Quarter, MktFare) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul du prix médian pondéré selon le trimestre
+quarter_median <- quarter_fare_dist |>
+  group_by(Quarter) |>
+  summarise(
+    fare_median = weighted_quantile(MktFare, passengers, probs = 0.5),
+    .groups = "drop"
+  )
+```
+
+```{r render-quarter-characteristics, echo=FALSE}
+# Regroupement des statistiques descriptives selon le trimestre
+table_quarter <- quarter_passengers |>
+  mutate(
+    share = passengers / sum(passengers)
+  ) |>
+  left_join(quarter_fare, by = "Quarter") |>
+  left_join(quarter_median, by = "Quarter") |>
+  left_join(quarter_yield, by = "Quarter")
+
+table_quarter_gt <- table_quarter |>
+  gt() |>
+  cols_label(
+    Quarter = "Trimestre",
+    passengers = "Passagers",
+    share = "Part",
+    fare = "Prix moyen",
+    fare_median = "Prix médian",
+    yield = "Yield moyen"
+  ) |>
+  fmt_number(columns = passengers, decimals = 0, sep_mark = ",") |>
+  fmt_percent(columns = share, decimals = 1) |>
+  fmt_currency(
+    columns = c(fare, fare_median),
+    currency = "USD",
+    decimals = 0
+  ) |>
+  fmt_number(columns = yield, decimals = 3) |>
+  cols_align(align = "center", columns = Quarter) |>
+  cols_align(
+    align = "right",
+    columns = c(passengers, share, fare, fare_median, yield)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+table_quarter_gt |> gtsave("tab_eda-quarter.html", path = "outputs/tabs/")
+
+table_quarter_gt
+```
+
+```{r compute-bulk-fare-characteristics}
+# Calcul des statistiques descriptives selon le type d'achat
+bulk_passengers <- mkt |>
+  group_by(BulkFare) |>
+  summarise(
+    rows = n(),
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul du prix moyen pondéré selon le type d'achat
+bulk_fare <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers)
+  ) |>
+  group_by(BulkFare) |>
+  summarise(
+    fare = sum(MktFare * Passengers, na.rm = TRUE) /
+      sum(Passengers, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul de la distribution pondérée du prix du billet selon le type d'achat
+bulk_fare_dist <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    Passengers > 0
+  ) |>
+  group_by(BulkFare, MktFare) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul du prix médian pondéré selon le type d'achat
+bulk_median <- bulk_fare_dist |>
+  group_by(BulkFare) |>
+  summarise(
+    fare_median = weighted_quantile(MktFare, passengers, 0.5),
+    .groups = "drop"
+  )
+```
+
+```{r render-bulk-fare-characteristics, echo=FALSE}
+# Regroupement des statistiques descriptives selon le type d'achat
+table_bulk <- bulk_passengers |>
+  mutate(
+    row_share = rows / sum(rows),
+    passenger_share = passengers / sum(passengers),
+    BulkFare = if_else(
+      BulkFare == 1,
+      "Achat de groupe",
+      "Achat individuel"
+    )
+  ) |>
+  left_join(
+    bulk_fare |>
+      mutate(
+        BulkFare = if_else(
+          BulkFare == 1,
+          "Achat de groupe",
+          "Achat individuel"
+        )
+      ),
+    by = "BulkFare"
+  ) |>
+  left_join(
+    bulk_median |>
+      mutate(
+        BulkFare = if_else(
+          BulkFare == 1,
+          "Achat de groupe",
+          "Achat individuel"
+        )
+      ),
+    by = "BulkFare"
+  )
+
+table_bulk_gt <- table_bulk |>
+  gt() |>
+  cols_label(
+    BulkFare = "Type d'achat",
+    rows = "Lignes",
+    passengers = "Passagers",
+    row_share = "Part des lignes",
+    passenger_share = "Part des passagers",
+    fare = "Prix moyen",
+    fare_median = "Prix médian"
+  ) |>
+  fmt_number(columns = c(rows, passengers), decimals = 0, sep_mark = ",") |>
+  fmt_percent(columns = c(row_share, passenger_share), decimals = 1) |>
+  fmt_currency(
+    columns = c(fare, fare_median),
+    currency = "USD",
+    decimals = 0
+  ) |>
+  cols_align(align = "left", columns = BulkFare) |>
+  cols_align(
+    align = "right",
+    columns = c(rows, passengers, row_share, passenger_share, fare, fare_median)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+table_bulk_gt |> gtsave("tab_eda-bulk.html", path = "outputs/tabs/")
+
+table_bulk_gt
+```
+
+```{r compute-bulk-fare-share}
+# Calcul de la part annuelle des passagers issue des achats groupés
+annual_bulk <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    # MktFare > 0,
+    Passengers > 0,
+    BulkFare == 1,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  group_by(Year) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect() |>
+  mutate(
+    share = passengers / sum(passengers)
+  )
+```
+
+```{r render-bulk-fare, echo=FALSE}
+ggplot(annual_bulk, aes(x = Year, y = share)) +
+  geom_col(fill = "gray50") +
+  geom_text(
+    aes(label = percent(share, accuracy = 0.1)),
+    vjust = -0.6,
+    size = 3
+  ) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_continuous(breaks = seq(2000, 2020, by = 2)) +
+  labs(
+    x = "Année",
+    y = "Part des passagers (en pourcentage)"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-bar-bulkfare.pdf", width = 8, height = 5)
+```
+
+```{r compute-fare-boxplot}
+# Déclaration de la fonction de calcul des statistiques d'une boîte à moustaches
+weighted_box <- function(x, w) {
+  q <- weighted_quantile(x, w, probs = c(0.25, 0.5, 0.75))
+
+  iqr <- q[3] - q[1]
+
+  lower_limit <- q[1] - 1.5 * iqr
+  upper_limit <- q[3] + 1.5 * iqr
+
+  tibble(
+    ymin = min(x[x >= lower_limit], na.rm = TRUE),
+    lower = q[1],
+    middle = q[2],
+    upper = q[3],
+    ymax = max(x[x <= upper_limit], na.rm = TRUE)
+  )
+}
+
+# Calcul des statistiques pondérées du prix du billet selon le trimestre
+quarter_fare_dist <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  group_by(Quarter, MktFare) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+fare_box <- quarter_fare_dist |>
+  group_by(Quarter) |>
+  group_modify(\(data, key) {
+    weighted_box(data$MktFare, data$passengers)
+  }) |>
+  ungroup()
+```
+
+```{r render-fare-boxplot, echo=FALSE}
+ggplot(
+  fare_box,
+  aes(
+    x = factor(Quarter, levels = 1:4, labels = c("T1", "T2", "T3", "T4")),
+    ymin = ymin,
+    lower = lower,
+    middle = middle,
+    upper = upper,
+    ymax = ymax
+  )
+) +
+  geom_boxplot(stat = "identity") +
+  labs(
+    x = "Trimestre",
+    y = "Prix du billet (en dollars américains)"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-fare-box.pdf", width = 8, height = 5)
+```
+
+```{r compute-fare-distributions}
+# Échantillonnage du logarithme du prix du billet
+set.seed(42)
+
+fare_sample <- dbGetQuery(
+  con,
+  "
+  SELECT LN(MktFare) AS log_MktFare
+  FROM mkt
+  WHERE MktFare > 0
+    AND BulkFare = 0
+  USING SAMPLE 10000 ROWS
+  "
+)
+
+# Agrégation du nombre de passagers selon le logarithme du prix du billet
+fare_hist <- dbGetQuery(
+  con,
+  "
+  SELECT
+    FLOOR(LN(MktFare) / 0.15) * 0.15 AS log_MktFare,
+    SUM(Passengers * 10) AS passengers
+  FROM mkt
+  WHERE MktFare > 0
+    AND BulkFare = 0
+    AND Passengers IS NOT NULL
+  GROUP BY 1
+  ORDER BY 1
+  "
+)
+```
+
+```{r render-fare-distributions, echo=FALSE}
+# Trace le diagramme quantile-quantile du logarithme du prix du billet
+ggplot(fare_sample, aes(sample = log_MktFare)) +
+  stat_qq(alpha = 0.1) +
+  stat_qq_line() +
+  labs(
+    x = "Quantile théorique",
+    y = "Quantile observé"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-fare-qq.pdf", width = 4, height = 5)
+
+# Trace la distribution du logarithme du prix du billet
+ggplot(fare_hist, aes(x = log_MktFare, y = passengers)) +
+  geom_col(fill = "grey50", width = 0.15) +
+  scale_y_continuous(labels = label_number(scale = 1e-6)) +
+  labs(
+    x = "Log(Prix du billet) (en dollars américains)",
+    y = "Nombre de passagers (en millions)"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-fare-hist.pdf", width = 4, height = 5)
+```
+
+# Caractéristiques de la distance et du nombre de coupons
+
+```{r compute-airport-groups}
+# Récupération des combinaisons uniques d'aéroports
+airport_groups <- mkt |>
+  distinct(AirportGroup) |>
+  collect() |>
+  mutate(
+    is_unique = sapply(
+      strsplit(AirportGroup, ":"),
+      function(x) !any(duplicated(x))
+    )
+  )
+
+# Sélection des combinaisons d'aéroports sans doublons
+# valid_airports <- airport_groups |>
+#   filter(is_unique) |>
+#   pull(AirportGroup)
+```
+
+```{r compute-distance-coupon-characteristics}
+library(dplyr)
+library(stringr)
+
+# Calcul des distributions pondérées de la distance et du nombre de coupons
+distance_dist <- mkt |>
+  filter(
+    !is.na(MktDistance),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID,
+    # AirportGroup %in% valid_airports
+  ) |>
+  group_by(MktDistance) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+
+# Calcul de la distribution pondérée du nombre de coupons
+coupon_dist <- mkt |>
+  filter(
+    !is.na(MktCoupons),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID,
+    # AirportGroup %in% valid_airports
+  ) |>
+  group_by(MktCoupons) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  collect()
+```
+
+```{r render-distance-coupon-characteristics, echo=FALSE}
+# Regroupement des statistiques pondérées de la distance et du nombre de coupons
+table_distance_coupon <- bind_rows(
+  weighted_stats(distance_dist$MktDistance, distance_dist$passengers) |>
+    mutate(Variable = "Distance parcourue"),
+  weighted_stats(coupon_dist$MktCoupons, coupon_dist$passengers) |>
+    mutate(Variable = "Nombre de coupons")
+) |>
+  select(Variable, everything())
+
+table_distance_coupon_gt <- table_distance_coupon |>
+  gt() |>
+  fmt_number(
+    columns = c(Minimum, Q1, Médiane, Moyenne, Q3, Maximum),
+    decimals = 2,
+    sep_mark = ","
+  ) |>
+  cols_align(align = "left", columns = Variable) |>
+  cols_align(
+    align = "right",
+    columns = c(Minimum, Q1, Médiane, Moyenne, Q3, Maximum)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+table_distance_coupon_gt |>
+  gtsave("tab_eda-distance-coupon.html", path = "outputs/tabs/")
+
+table_distance_coupon_gt
+```
+
+# Répartition du nombre de coupons
+
+```{r compute-coupon-distribution}
+# Calcul de la répartition du nombre de passagers selon le nombre de coupons
+table_coupons <- mkt |>
+  filter(
+    !is.na(MktCoupons),
+    !is.na(Passengers),
+    Passengers > 0,
+    BulkFare == 0
+  ) |>
+  mutate(
+    coupons = case_when(
+      MktCoupons == 1 ~ "1",
+      MktCoupons == 2 ~ "2",
+      MktCoupons == 3 ~ "3",
+      MktCoupons >= 4 ~ "4 ou plus"
+    )
+  ) |>
+  group_by(coupons) |>
+  summarise(
+    passengers = sum(
+      Passengers * 10,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  collect() |>
+  mutate(
+    share = passengers / sum(passengers),
+    coupons = factor(
+      coupons,
+      levels = c(
+        "1",
+        "2",
+        "3",
+        "4 ou plus"
+      )
+    )
+  ) |>
+  arrange(coupons)
+```
+
+```{r render-coupon-distribution, echo=FALSE}
+table_coupons_gt <- table_coupons |>
+  gt() |>
+  cols_label(
+    coupons = "Nombre de coupons",
+    passengers = "Passagers",
+    share = "Part"
+  ) |>
+  fmt_number(columns = passengers, decimals = 0, sep_mark = ",") |>
+  fmt_percent(columns = share, decimals = 1) |>
+  cols_align(align = "center", columns = coupons) |>
+  cols_align(align = "right", columns = c(passengers, share)) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+table_coupons_gt |> gtsave("tab_eda-coupons.html", path = "outputs/tabs/")
+
+table_coupons_gt
+```
+
+# Principaux marchés origine-destination
+
+```{r compute-top-markets}
+# Calcul du nombre total de passagers
+total_passengers <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE)
+  ) |>
+  collect() |>
+  pull(passengers)
+
+# Sélection des dix principaux marchés origine-destination
+top_markets <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  group_by(OriginCityMarketID, DestCityMarketID) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(passengers)) |>
+  head(10) |>
+  recode_cols(
+    c("OriginCityMarketID", "DestCityMarketID"),
+    list(lookups$city_market_id, lookups$city_market_id)
+  ) |>
+  collect() |>
+  arrange(desc(passengers)) |>
+  mutate(
+    rank = row_number(),
+    share = passengers / total_passengers
+  ) |>
+  select(
+    rank,
+    OriginCityMarketID,
+    DestCityMarketID,
+    passengers,
+    share
+  )
+```
+
+```{r render-top-markets, echo=FALSE}
+top_markets_gt <- top_markets |>
+  gt() |>
+  cols_label(
+    rank = "Rang",
+    OriginCityMarketID = "Origine",
+    DestCityMarketID = "Destination",
+    passengers = "Passagers",
+    share = "Part"
+  ) |>
+  fmt_number(columns = passengers, decimals = 0, sep_mark = ",") |>
+  fmt_percent(columns = share, decimals = 2) |>
+  cols_align(
+    align = "left",
+    columns = c(OriginCityMarketID, DestCityMarketID)
+  ) |>
+  cols_align(align = "center", columns = rank) |>
+  cols_align(align = "right", columns = c(passengers, share)) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(
+    table_body.hlines.color = "transparent",
+    stub.border.color = "transparent"
+  )
+
+top_markets_gt |> gtsave("tab_eda-top-markets.html", path = "outputs/tabs/")
+
+top_markets_gt
+```
+
+```{r render-top-markets-share, echo=FALSE}
+# Calcul de la part cumulée des dix principaux marchés origine-destination
+sum(top_markets$share)
+```
+
+```{r compute-top-carriers}
+# Sélection des huit principaux transporteurs selon le nombre de passagers
+top_carriers <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  group_by(TkCarrier) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  recode_col("TkCarrier", lookups$carriers) |>
+  arrange(desc(passengers)) |>
+  head(8) |>
+  collect()
+
+total_passengers <- mkt |>
+  filter(
+    !is.na(MktFare),
+    !is.na(Passengers),
+    MktFare > 0,
+    Passengers > 0,
+    BulkFare == 0,
+    OriginCityMarketID != DestCityMarketID
+  ) |>
+  summarise(
+    passengers = sum(Passengers * 10, na.rm = TRUE)
+  ) |>
+  collect() |>
+  pull(passengers)
+
+# Regroupement des autres transporteurs dans une même catégorie
+carrier_share <- bind_rows(
+  top_carriers,
+  tibble(
+    TkCarrier = "Autres",
+    passengers = total_passengers - sum(top_carriers$passengers)
+  )
+) |>
+  mutate(
+    share = passengers / total_passengers,
+    TkCarrier = factor(
+      TkCarrier,
+      levels = rev(c(top_carriers$TkCarrier, "Autres"))
+    )
+  )
+```
+
+```{r render-top-carriers, echo=FALSE}
+ggplot(carrier_share, aes(x = TkCarrier, y = share)) +
+  geom_col(width = 0.6, fill = "grey50") +
+  geom_text(aes(label = percent(share, accuracy = 0.1)), hjust = -0.1) +
+  coord_flip() +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    x = NULL,
+    y = "Part des passagers (en pourcentage)"
+  ) +
+  theme_minimal()
+
+ggsave("outputs/figs/fig_eda-od.pdf", width = 8, height = 5)
+```

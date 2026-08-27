@@ -1,0 +1,7 @@
+project:
+  type: default
+  output-dir: outputs/html
+  execute-dir: project
+
+bibliography: references.bib
+csl: chicago-author-date.csl
