@@ -115,7 +115,7 @@ class BTSDownloader:
       for year in range(start_year, end_year + 1):
         for quarter in range(1, 5):
           # DB1B est disponible jusqu'au deuxième trimestre 2025.
-          if year == 2025 and quarter > 2:
+          if year > 2025 or (year == 2025 and quarter > 2):
             continue
 
           url = self.db1b_url.format(table=bts_table, year=year, period=quarter)

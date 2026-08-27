@@ -49,10 +49,14 @@ list(
   # Fichiers bruts DB1B MARKET à intégrer au pipeline
   tar_target(
     DB1B_mkt_files,
-    dir_ls(
-      "data/raw/MARKET/DB1B/",
-      regexp = "DB1B\\.MARKET\\.[0-9]{4}\\.[1-4]\\.parquet$"
-    ),
+    {
+      path <- "data/raw/MARKET/DB1B/"
+      if (!dir_exists(path)) return(character(0))
+      dir_ls(
+        path,
+        regexp = "DB1B\\.MARKET\\.[0-9]{4}\\.[1-4]\\.parquet$"
+      )
+    },
     format = "file"
   ),
 
@@ -60,6 +64,8 @@ list(
   tar_target(
     DB1B_mkt_partition,
     {
+      if (length(DB1B_mkt_files) == 0) return("data/interim/MARKET/DB1B")
+
       db1b_mkt_raw <- open_dataset(DB1B_mkt_files)
 
       # Ignore les éventuelles colonnes dont le nom est vide.
